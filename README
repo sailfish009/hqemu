@@ -1,3 +1,17 @@
+
+HQEMU is a retargetable and multi-threaded dynamic binary translator on multicores. 
+It integrates QEMU and LLVM as its building blocks. 
+The translator in the enhanced QEMU acts as a fast translator with low translation overhead. 
+The optimization-intensive LLVM optimizer running on separate threads dynamically improves code for higher performance. 
+With the hybrid QEMU+LLVM approach, HQEMU can achieve low translation overhead and good translated code quality.
+
+HQEMU supports process-level emulation and full-system virtualization. 
+It provides translation modes of running the QEMU translator and LLVM optimizer in one process, 
+or running the LLVM optimizer as a stand-alone optimization server (version 0.13.0).
+         
+![](images/hqemu.png?raw=true)         
+         
+         
          QEMU README
          ===========
 
