@@ -8,8 +8,8 @@ With the hybrid QEMU+LLVM approach, HQEMU can achieve low translation overhead a
 HQEMU supports process-level emulation and full-system virtualization. 
 It provides translation modes of running the QEMU translator and LLVM optimizer in one process, 
 or running the LLVM optimizer as a stand-alone optimization server (version 0.13.0).
-         
-![alt text](https://raw.githubusercontent.com/sailfish009/hqemu/master/images/hqemu.png?raw=true)
+
+![hqemu](https://user-images.githubusercontent.com/17582766/37698678-cd2d4f96-2cdb-11e8-83b5-a9fdacf61980.png)
 
          
          QEMU README
