@@ -1,0 +1,42 @@
+# This file is a template, and might need editing before it works on your project.
+# use the official gcc image, based on debian
+# can use verions as well, like gcc:5.2
+# see https://hub.docker.com/_/gcc/
+image: toppldi/gitlab-runner:1.0.0
+
+before_script:
+    - export PATH="/etc/llvm/bin:$PATH"
+
+stages:
+  - build
+  - test
+
+build:
+  stage: build
+  # instead of calling g++ directly you can also use some build toolkit like make
+  # install the necessary build tools when needed
+  # before_script: 
+  #   - apt update && apt -y install make autoconf 
+  script: 
+    - mkdir -p build
+    - ./configure --prefix=`pwd`/build --target-list=x86_64-linux-user --enable-llvm
+    - make -j8 && make install
+  # artifacts:
+  #  paths:
+  #    - build/*-linux-user/qemu-*
+  # depending on your build setup it's most likely a good idea to cache outputs to reduce the build time
+  artifacts:
+    paths:
+      - "build/"
+
+test:
+  stage: test
+  # test common x86_64 applications
+  script:
+    - ./build/bin/qemu-x86_64 /bin/ls
+    - ./build/bin/qemu-x86_64 /bin/ps
+    - ./build/bin/qemu-x86_64 /bin/echo "output"
+  dependencies:
+    - build
+
+# run tests using the binary built before

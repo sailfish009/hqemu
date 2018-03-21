@@ -1,0 +1,348 @@
+diff -ruN a/include/llvm/ExecutionEngine/ExecutionEngine.h b/include/llvm/ExecutionEngine/ExecutionEngine.h
+--- a/include/llvm/ExecutionEngine/ExecutionEngine.h	2016-07-01 02:25:11.000000000 +0800
++++ b/include/llvm/ExecutionEngine/ExecutionEngine.h	2016-10-28 22:25:13.929380744 +0800
+@@ -550,6 +550,7 @@
+   /// is called and is successful, the created engine takes ownership of the
+   /// memory manager. This option defaults to NULL.
+   EngineBuilder &setMCJITMemoryManager(std::unique_ptr<RTDyldMemoryManager> mcjmm);
++  EngineBuilder &setMCJITMemoryManager(std::shared_ptr<RTDyldMemoryManager> mcjmm);
+ 
+   EngineBuilder&
+   setMemoryManager(std::unique_ptr<MCJITMemoryManager> MM);
+diff -ruN a/include/llvm/MC/MCInst.h b/include/llvm/MC/MCInst.h
+--- a/include/llvm/MC/MCInst.h	2015-06-05 03:49:52.000000000 +0800
++++ b/include/llvm/MC/MCInst.h	2016-10-28 22:25:13.929380744 +0800
+@@ -27,6 +27,7 @@
+ class MCInstPrinter;
+ class MCExpr;
+ class MCInst;
++class DebugLoc;
+ 
+ /// \brief Instances of this class represent operands of the MCInst class.
+ /// This is a simple discriminated union.
+@@ -151,9 +152,10 @@
+   unsigned Opcode;
+   SMLoc Loc;
+   SmallVector<MCOperand, 8> Operands;
++  const DebugLoc *DbgLoc;
+ 
+ public:
+-  MCInst() : Opcode(0) {}
++  MCInst() : Opcode(0), DbgLoc(nullptr) {}
+ 
+   void setOpcode(unsigned Op) { Opcode = Op; }
+   unsigned getOpcode() const { return Opcode; }
+@@ -161,6 +163,9 @@
+   void setLoc(SMLoc loc) { Loc = loc; }
+   SMLoc getLoc() const { return Loc; }
+ 
++  void setDebugLoc(const DebugLoc *Loc) { DbgLoc = Loc; }
++  const DebugLoc *getDebugLoc() const { return DbgLoc; }
++
+   const MCOperand &getOperand(unsigned i) const { return Operands[i]; }
+   MCOperand &getOperand(unsigned i) { return Operands[i]; }
+   unsigned getNumOperands() const { return Operands.size(); }
+diff -ruN a/include/llvm/MC/MCInstrInfo.h b/include/llvm/MC/MCInstrInfo.h
+--- a/include/llvm/MC/MCInstrInfo.h	2015-06-23 17:49:53.000000000 +0800
++++ b/include/llvm/MC/MCInstrInfo.h	2016-10-28 22:25:13.930380744 +0800
+@@ -26,6 +26,7 @@
+   const unsigned *InstrNameIndices; // Array for name indices in InstrNameData
+   const char *InstrNameData;        // Instruction name string pool
+   unsigned NumOpcodes;              // Number of entries in the desc array
++  unsigned long HQEMUExitAddr;
+ 
+ public:
+   /// \brief Initialize MCInstrInfo, called by TableGen auto-generated routines.
+@@ -52,6 +53,9 @@
+     assert(Opcode < NumOpcodes && "Invalid opcode!");
+     return &InstrNameData[InstrNameIndices[Opcode]];
+   }
++
++  void setHQEMUExitAddr(unsigned long Addr) { HQEMUExitAddr = Addr; }
++  unsigned long getHQEMUExitAddr() const { return HQEMUExitAddr; }
+ };
+ 
+ } // End llvm namespace
+diff -ruN a/include/llvm/Target/TargetMachine.h b/include/llvm/Target/TargetMachine.h
+--- a/include/llvm/Target/TargetMachine.h	2016-07-01 02:25:11.000000000 +0800
++++ b/include/llvm/Target/TargetMachine.h	2016-10-28 22:25:13.930380744 +0800
+@@ -158,6 +158,8 @@
+   const MCInstrInfo *getMCInstrInfo() const { return MII; }
+   const MCSubtargetInfo *getMCSubtargetInfo() const { return STI; }
+ 
++  virtual const TargetRegisterInfo *getRegisterInfo() const { return nullptr; }
++
+   /// If intrinsic information is available, return it.  If not, return null.
+   virtual const TargetIntrinsicInfo *getIntrinsicInfo() const {
+     return nullptr;
+diff -ruN a/include/llvm/Target/TargetRegisterInfo.h b/include/llvm/Target/TargetRegisterInfo.h
+--- a/include/llvm/Target/TargetRegisterInfo.h	2016-05-20 04:03:16.000000000 +0800
++++ b/include/llvm/Target/TargetRegisterInfo.h	2016-10-28 22:25:13.931380744 +0800
+@@ -275,6 +275,8 @@
+   virtual ~TargetRegisterInfo();
+ public:
+ 
++  std::vector<unsigned> HQEMUReservedRegs;
++
+   // Register numbers can represent physical registers, virtual registers, and
+   // sometimes stack slots. The unsigned values are divided into these ranges:
+   //
+@@ -489,6 +491,10 @@
+   /// used by register scavenger to determine what registers are free.
+   virtual BitVector getReservedRegs(const MachineFunction &MF) const = 0;
+ 
++  /// Get/Set extra reserved register(s) by HQEMU.
++  virtual void getHQEMUReservedRegs(BitVector &Reserved) const { }
++  virtual void setHQEMUReservedRegs(std::string RegName) { }
++
+   /// Prior to adding the live-out mask to a stackmap or patchpoint
+   /// instruction, provide the target the opportunity to adjust it (mainly to
+   /// remove pseudo-registers that should be ignored).
+diff -ruN a/lib/ExecutionEngine/ExecutionEngine.cpp b/lib/ExecutionEngine/ExecutionEngine.cpp
+--- a/lib/ExecutionEngine/ExecutionEngine.cpp	2016-06-23 04:29:42.000000000 +0800
++++ b/lib/ExecutionEngine/ExecutionEngine.cpp	2016-10-28 22:25:13.932380744 +0800
+@@ -492,6 +492,13 @@
+   return *this;
+ }
+ 
++EngineBuilder &EngineBuilder::setMCJITMemoryManager(
++                                   std::shared_ptr<RTDyldMemoryManager> mcjmm) {
++  MemMgr = mcjmm;
++  Resolver = mcjmm;
++  return *this;
++}
++
+ EngineBuilder&
+ EngineBuilder::setMemoryManager(std::unique_ptr<MCJITMemoryManager> MM) {
+   MemMgr = std::shared_ptr<MCJITMemoryManager>(std::move(MM));
+diff -ruN a/lib/Target/X86/MCTargetDesc/X86MCCodeEmitter.cpp b/lib/Target/X86/MCTargetDesc/X86MCCodeEmitter.cpp
+--- a/lib/Target/X86/MCTargetDesc/X86MCCodeEmitter.cpp	2016-07-07 05:19:11.000000000 +0800
++++ b/lib/Target/X86/MCTargetDesc/X86MCCodeEmitter.cpp	2016-10-28 22:25:13.932380744 +0800
+@@ -23,6 +23,7 @@
+ #include "llvm/MC/MCSubtargetInfo.h"
+ #include "llvm/MC/MCSymbol.h"
+ #include "llvm/Support/raw_ostream.h"
++#include "llvm/IR/DebugLoc.h"
+ 
+ using namespace llvm;
+ 
+@@ -142,6 +143,9 @@
+                         const MCInst &MI, const MCInstrDesc &Desc,
+                         const MCSubtargetInfo &STI, raw_ostream &OS) const;
+ 
++  bool EmitHQEMUInstruction(const MCInst &MI, raw_ostream &OS,
++                            SmallVectorImpl<MCFixup> &Fixups) const;
++
+   uint8_t DetermineREXPrefix(const MCInst &MI, uint64_t TSFlags,
+                              int MemOperand, const MCInstrDesc &Desc) const;
+ };
+@@ -1110,6 +1114,52 @@
+   return Ret;
+ }
+ 
++bool X86MCCodeEmitter::
++EmitHQEMUInstruction(const MCInst &MI, raw_ostream &OS,
++                     SmallVectorImpl<MCFixup> &Fixups) const {
++  /* NOTE: the following flags must be synchronized with those in file
++   *       llvm-opc.h of the HQEMU source tree. */
++  enum {
++    PATCH_HQEMU = 0x4182U,
++    PATCH_DUMMY,
++    PATCH_EXIT_TB,
++    PATCH_DIRECT_JUMP,
++    PATCH_TRACE_BLOCK_CHAINING,
++    PATCH_QMMU
++  };
++
++  unsigned Opcode = MI.getOpcode();
++  switch (Opcode) {
++  case X86::TRAP:
++  case X86::RETQ:
++    break;
++  default: return false;
++  }
++
++  unsigned CurByte = 0;
++  const DebugLoc *Loc = MI.getDebugLoc();
++  if (!Loc)
++    return false;
++
++  unsigned PatchType = Loc->getLine();
++  if (PatchType < PATCH_HQEMU || PatchType > PATCH_QMMU)
++    return false;
++
++  if (Opcode == X86::TRAP) {
++    for (unsigned i = 0; i != 8; ++i)
++      EmitByte(0x90, CurByte, OS);
++    return true;
++  }
++  if (Opcode == X86::RETQ) {
++    uintptr_t ExitAddr = MCII.getHQEMUExitAddr();
++    EmitByte(0xE9, CurByte, OS);
++    EmitImmediate(MCOperand::createImm(ExitAddr), MI.getLoc(), 4, FK_PCRel_4,
++                  CurByte, OS, Fixups);
++    return true;
++  }
++  return false;
++}
++
+ void X86MCCodeEmitter::
+ encodeInstruction(const MCInst &MI, raw_ostream &OS,
+                   SmallVectorImpl<MCFixup> &Fixups,
+@@ -1118,6 +1168,9 @@
+   const MCInstrDesc &Desc = MCII.get(Opcode);
+   uint64_t TSFlags = Desc.TSFlags;
+ 
++  if (EmitHQEMUInstruction(MI, OS, Fixups))
++    return;
++
+   // Pseudo instructions don't get encoded.
+   if ((TSFlags & X86II::FormMask) == X86II::Pseudo)
+     return;
+diff -ruN a/lib/Target/X86/X86MCInstLower.cpp b/lib/Target/X86/X86MCInstLower.cpp
+--- a/lib/Target/X86/X86MCInstLower.cpp	2016-07-14 12:06:33.000000000 +0800
++++ b/lib/Target/X86/X86MCInstLower.cpp	2016-10-28 22:25:13.932380744 +0800
+@@ -389,6 +389,9 @@
+ void X86MCInstLower::Lower(const MachineInstr *MI, MCInst &OutMI) const {
+   OutMI.setOpcode(MI->getOpcode());
+ 
++  if (MI->getDebugLoc())
++    OutMI.setDebugLoc(&MI->getDebugLoc());
++
+   for (const MachineOperand &MO : MI->operands())
+     if (auto MaybeMCOp = LowerMachineOperand(MI, MO))
+       OutMI.addOperand(MaybeMCOp.getValue());
+diff -ruN a/lib/Target/X86/X86RegisterInfo.cpp b/lib/Target/X86/X86RegisterInfo.cpp
+--- a/lib/Target/X86/X86RegisterInfo.cpp	2016-05-13 03:58:32.000000000 +0800
++++ b/lib/Target/X86/X86RegisterInfo.cpp	2016-10-28 22:25:13.932380744 +0800
+@@ -503,9 +503,65 @@
+     }
+   }
+ 
++  MF.getTarget().getRegisterInfo()->getHQEMUReservedRegs(Reserved);
+   return Reserved;
+ }
+ 
++void X86RegisterInfo::getHQEMUReservedRegs(BitVector &Reserved) const {
++  for (unsigned i = 0, e = HQEMUReservedRegs.size(); i != e; ++i)
++    Reserved.set(HQEMUReservedRegs[i]);
++}
++
++void X86RegisterInfo::setHQEMUReservedRegs(std::string RegName) {
++#define RESERVE1(x) \
++  do { \
++    HQEMUReservedRegs.push_back(X86::x ## L); \
++    HQEMUReservedRegs.push_back(X86::x ## H); \
++    HQEMUReservedRegs.push_back(X86::x ## X);\
++    HQEMUReservedRegs.push_back(X86::E ## x ## X);\
++    HQEMUReservedRegs.push_back(X86::R ## x ## X);\
++    return; \
++  } while(0)
++
++#define RESERVE2(x) \
++  do { \
++    HQEMUReservedRegs.push_back(X86::R ## x); \
++    HQEMUReservedRegs.push_back(X86::R ## x ## B);\
++    HQEMUReservedRegs.push_back(X86::R ## x ## D);\
++    HQEMUReservedRegs.push_back(X86::R ## x ## W);\
++    return; \
++  } while(0)
++
++  if (RegName == "ebp") {
++    // 32-bit registers
++    HQEMUReservedRegs.push_back(X86::EBP);
++    // 16-bit registers
++    HQEMUReservedRegs.push_back(X86::BP);
++#if defined(__x86_64__)
++    // X86-64 only
++    HQEMUReservedRegs.push_back(X86::BPL);
++#endif
++    return;
++  }
++#if defined(__x86_64__)
++  if (RegName == "rax") RESERVE1(A);
++  if (RegName == "rbx") RESERVE1(B);
++  if (RegName == "rcx") RESERVE1(C);
++  if (RegName == "rdx") RESERVE1(D);
++  if (RegName == "r8")  RESERVE2(8);
++  if (RegName == "r9")  RESERVE2(9);
++  if (RegName == "r10") RESERVE2(10);
++  if (RegName == "r11") RESERVE2(11);
++  if (RegName == "r12") RESERVE2(12);
++  if (RegName == "r13") RESERVE2(13);
++  if (RegName == "r14") RESERVE2(14);
++  if (RegName == "r15") RESERVE2(15);
++#endif
++
++#undef RESERVE1
++#undef RESERVE2
++}
++
+ void X86RegisterInfo::adjustStackMapLiveOutMask(uint32_t *Mask) const {
+   // Check if the EFLAGS register is marked as live-out. This shouldn't happen,
+   // because the calling convention defines the EFLAGS register as NOT
+diff -ruN a/lib/Target/X86/X86RegisterInfo.h b/lib/Target/X86/X86RegisterInfo.h
+--- a/lib/Target/X86/X86RegisterInfo.h	2016-01-12 09:08:46.000000000 +0800
++++ b/lib/Target/X86/X86RegisterInfo.h	2016-10-28 22:25:13.933380744 +0800
+@@ -115,6 +115,9 @@
+   /// register scavenger to determine what registers are free.
+   BitVector getReservedRegs(const MachineFunction &MF) const override;
+ 
++  void getHQEMUReservedRegs(BitVector &Reserved) const;
++  void setHQEMUReservedRegs(std::string RegName);
++
+   void adjustStackMapLiveOutMask(uint32_t *Mask) const override;
+ 
+   bool hasBasePointer(const MachineFunction &MF) const;
+diff -ruN a/lib/Target/X86/X86TargetMachine.h b/lib/Target/X86/X86TargetMachine.h
+--- a/lib/Target/X86/X86TargetMachine.h	2016-05-19 06:04:49.000000000 +0800
++++ b/lib/Target/X86/X86TargetMachine.h	2016-10-28 22:25:13.933380744 +0800
+@@ -38,6 +38,10 @@
+ 
+   TargetIRAnalysis getTargetIRAnalysis() override;
+ 
++  const X86RegisterInfo *getRegisterInfo() const override {
++    return Subtarget.getRegisterInfo();
++  }
++
+   // Set up the pass pipeline.
+   TargetPassConfig *createPassConfig(PassManagerBase &PM) override;
+   TargetLoweringObjectFile *getObjFileLowering() const override {
+diff -ruN a/lib/Transforms/Utils/Local.cpp b/lib/Transforms/Utils/Local.cpp
+--- a/lib/Transforms/Utils/Local.cpp	2016-06-25 16:34:38.000000000 +0800
++++ b/lib/Transforms/Utils/Local.cpp	2016-10-28 22:25:13.933380744 +0800
+@@ -1417,11 +1417,14 @@
+           // If we found a call to a no-return function, insert an unreachable
+           // instruction after it.  Make sure there isn't *already* one there
+           // though.
++#if 0
++          // HQEMU: do not delete instructions after llvm.trap.
+           if (!isa<UnreachableInst>(CI->getNextNode())) {
+             // Don't insert a call to llvm.trap right before the unreachable.
+             changeToUnreachable(CI->getNextNode(), false);
+             Changed = true;
+           }
++#endif
+           break;
+         }
+       }
+diff -ruN a/lib/Transforms/Utils/SimplifyCFG.cpp b/lib/Transforms/Utils/SimplifyCFG.cpp
+--- a/lib/Transforms/Utils/SimplifyCFG.cpp	2016-06-26 20:28:59.000000000 +0800
++++ b/lib/Transforms/Utils/SimplifyCFG.cpp	2016-10-28 22:25:13.933380744 +0800
+@@ -1201,6 +1201,8 @@
+ 
+   bool Changed = false;
+   do {
++    if (isa<IntrinsicInst>(I1) || I1->hasMetadata())
++      return Changed;
+     // If we are hoisting the terminator instruction, don't move one (making a
+     // broken BB), instead clone it, and remove BI.
+     if (isa<TerminatorInst>(I1))
+@@ -5088,6 +5090,7 @@
+   BasicBlock *BB = IBI->getParent();
+   bool Changed = false;
+ 
++  return false;
+   // Eliminate redundant destinations.
+   SmallPtrSet<Value *, 8> Succs;
+   for (unsigned i = 0, e = IBI->getNumDestinations(); i != e; ++i) {

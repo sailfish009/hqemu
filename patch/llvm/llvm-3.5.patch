@@ -1,0 +1,851 @@
+diff -ruN a/include/llvm/MC/MCInst.h b/include/llvm/MC/MCInst.h
+--- a/include/llvm/MC/MCInst.h	2014-04-13 12:57:38.000000000 +0800
++++ b/include/llvm/MC/MCInst.h	2016-07-03 21:12:39.134529935 +0800
+@@ -20,6 +20,7 @@
+ #include "llvm/ADT/StringRef.h"
+ #include "llvm/Support/DataTypes.h"
+ #include "llvm/Support/SMLoc.h"
++#include "llvm/IR/DebugLoc.h"
+ 
+ namespace llvm {
+ class raw_ostream;
+@@ -151,6 +152,7 @@
+   unsigned Opcode;
+   SMLoc Loc;
+   SmallVector<MCOperand, 8> Operands;
++  DebugLoc DbgLoc;
+ public:
+   MCInst() : Opcode(0) {}
+ 
+@@ -160,6 +162,9 @@
+   void setLoc(SMLoc loc) { Loc = loc; }
+   SMLoc getLoc() const { return Loc; }
+ 
++  void setDebugLoc(DebugLoc &Loc) { DbgLoc = Loc; }
++  DebugLoc getDebugLoc() const { return DbgLoc; }
++
+   const MCOperand &getOperand(unsigned i) const { return Operands[i]; }
+   MCOperand &getOperand(unsigned i) { return Operands[i]; }
+   unsigned getNumOperands() const { return Operands.size(); }
+diff -ruN a/include/llvm/Target/TargetRegisterInfo.h b/include/llvm/Target/TargetRegisterInfo.h
+--- a/include/llvm/Target/TargetRegisterInfo.h	2014-07-17 04:13:31.000000000 +0800
++++ b/include/llvm/Target/TargetRegisterInfo.h	2016-07-03 21:49:58.222511990 +0800
+@@ -238,6 +238,8 @@
+   virtual ~TargetRegisterInfo();
+ public:
+ 
++  std::vector<unsigned> HQEMUReservedRegs;
++
+   // Register numbers can represent physical registers, virtual registers, and
+   // sometimes stack slots. The unsigned values are divided into these ranges:
+   //
+@@ -452,6 +454,10 @@
+   /// used by register scavenger to determine what registers are free.
+   virtual BitVector getReservedRegs(const MachineFunction &MF) const = 0;
+ 
++  /// Get/Set extra reserved register(s) by HQEMU.
++  virtual void getHQEMUReservedRegs(BitVector &Reserved) const { }
++  virtual void setHQEMUReservedRegs(std::string RegName) { }
++
+   /// getMatchingSuperReg - Return a super-register of the specified register
+   /// Reg so its sub-register of index SubIdx is Reg.
+   unsigned getMatchingSuperReg(unsigned Reg, unsigned SubIdx,
+diff -ruN a/lib/ExecutionEngine/JIT/JITEmitter.cpp b/lib/ExecutionEngine/JIT/JITEmitter.cpp
+--- a/lib/ExecutionEngine/JIT/JITEmitter.cpp	2014-07-18 04:05:29.000000000 +0800
++++ b/lib/ExecutionEngine/JIT/JITEmitter.cpp	2016-07-03 21:12:39.134529935 +0800
+@@ -365,7 +365,10 @@
+ 
+     }
+     ~JITEmitter() {
++#if 0
++      // HQEMU has the ownership of the memory manager. Do not delete it.
+       delete MemMgr;
++#endif
+     }
+ 
+     JITResolver &getJITResolver() { return Resolver; }
+diff -ruN a/lib/ExecutionEngine/MCJIT/MCJIT.h b/lib/ExecutionEngine/MCJIT/MCJIT.h
+--- a/lib/ExecutionEngine/MCJIT/MCJIT.h	2014-04-30 05:52:46.000000000 +0800
++++ b/lib/ExecutionEngine/MCJIT/MCJIT.h	2016-07-03 21:12:39.134529935 +0800
+@@ -77,7 +77,11 @@
+ 
+ private:
+   MCJIT *ParentEngine;
++#if 0
+   std::unique_ptr<RTDyldMemoryManager> ClientMM;
++#endif
++  // HQEMU has the ownership of the memory manager. Do not delete it.
++  RTDyldMemoryManager *ClientMM;
+ };
+ 
+ // About Module states: added->loaded->finalized.
+diff -ruN a/lib/Target/ARM/ARMBaseRegisterInfo.cpp b/lib/Target/ARM/ARMBaseRegisterInfo.cpp
+--- a/lib/Target/ARM/ARMBaseRegisterInfo.cpp	2014-07-17 04:13:31.000000000 +0800
++++ b/lib/Target/ARM/ARMBaseRegisterInfo.cpp	2016-07-03 21:18:50.850526956 +0800
+@@ -149,9 +149,39 @@
+     for (MCSubRegIterator SI(*I, this); SI.isValid(); ++SI)
+       if (Reserved.test(*SI)) Reserved.set(*I);
+ 
++  getHQEMUReservedRegs(Reserved);
+   return Reserved;
+ }
+ 
++void ARMBaseRegisterInfo::getHQEMUReservedRegs(BitVector &Reserved) const {
++  for (unsigned i = 0, e = HQEMUReservedRegs.size(); i != e; ++i)
++    Reserved.set(HQEMUReservedRegs[i]);
++}
++
++void ARMBaseRegisterInfo::setHQEMUReservedRegs(std::string RegName) {
++#define RESERVE(x) \
++  do { \
++    HQEMUReservedRegs.push_back(ARM::R ## x); \
++    return; \
++  } while(0)
++
++  if (RegName == "r0")  RESERVE(0);
++  if (RegName == "r1")  RESERVE(1);
++  if (RegName == "r2")  RESERVE(2);
++  if (RegName == "r3")  RESERVE(3);
++  if (RegName == "r4")  RESERVE(4);
++  if (RegName == "r5")  RESERVE(5);
++  if (RegName == "r6")  RESERVE(6);
++  if (RegName == "r7")  RESERVE(7);
++  if (RegName == "r8")  RESERVE(8);
++  if (RegName == "r9")  RESERVE(9);
++  if (RegName == "r10") RESERVE(10);
++  if (RegName == "r11") RESERVE(11);
++  if (RegName == "r12") RESERVE(12);
++
++#undef RESERVE
++}
++
+ const TargetRegisterClass*
+ ARMBaseRegisterInfo::getLargestLegalSuperClass(const TargetRegisterClass *RC)
+                                                                          const {
+diff -ruN a/lib/Target/ARM/ARMBaseRegisterInfo.h b/lib/Target/ARM/ARMBaseRegisterInfo.h
+--- a/lib/Target/ARM/ARMBaseRegisterInfo.h	2014-07-17 04:13:31.000000000 +0800
++++ b/lib/Target/ARM/ARMBaseRegisterInfo.h	2016-07-03 21:19:12.898526779 +0800
+@@ -117,6 +117,9 @@
+ 
+   BitVector getReservedRegs(const MachineFunction &MF) const override;
+ 
++  void getHQEMUReservedRegs(BitVector &Reserved) const;
++  void setHQEMUReservedRegs(std::string RegName);
++
+   const TargetRegisterClass *
+   getPointerRegClass(const MachineFunction &MF,
+                      unsigned Kind = 0) const override;
+diff -ruN a/lib/Target/X86/MCTargetDesc/X86MCCodeEmitter.cpp b/lib/Target/X86/MCTargetDesc/X86MCCodeEmitter.cpp
+--- a/lib/Target/X86/MCTargetDesc/X86MCCodeEmitter.cpp	2014-07-18 01:04:50.000000000 +0800
++++ b/lib/Target/X86/MCTargetDesc/X86MCCodeEmitter.cpp	2016-07-03 21:12:39.138529935 +0800
+@@ -164,6 +164,9 @@
+                         const MCInst &MI, const MCInstrDesc &Desc,
+                         const MCSubtargetInfo &STI,
+                         raw_ostream &OS) const;
++
++  bool EmitHQEMUInstruction(const MCInst &MI, raw_ostream &OS,
++                            SmallVectorImpl<MCFixup> &Fixups) const;
+ };
+ 
+ } // end anonymous namespace
+@@ -1151,6 +1154,50 @@
+   }
+ }
+ 
++bool X86MCCodeEmitter::
++EmitHQEMUInstruction(const MCInst &MI, raw_ostream &OS,
++                     SmallVectorImpl<MCFixup> &Fixups) const {
++  /* NOTE: the following flags must be synchronized with those in file
++   *       llvm-opc.h of the HQEMU source tree. */
++  enum {
++    PATCH_HQEMU = 0x4182U,
++    PATCH_DUMMY,
++    PATCH_EXIT_TB,
++    PATCH_DIRECT_JUMP,
++    PATCH_TRACE_BLOCK_CHAINING,
++    PATCH_QMMU
++  };
++
++  unsigned Opcode = MI.getOpcode();
++  switch (Opcode) {
++  case X86::TRAP:
++  case X86::RETQ:
++    break;
++  default: return false;
++  }
++
++  unsigned CurByte = 0;
++  DebugLoc Loc = MI.getDebugLoc();
++  if (Loc.isUnknown())
++    return false;
++
++  unsigned PatchType = Loc.getLine();
++  if (PatchType < PATCH_HQEMU || PatchType > PATCH_QMMU)
++    return false;
++
++  if (Opcode == X86::TRAP) {
++    for (unsigned i = 0; i != 8; ++i)
++      EmitByte(0x90, CurByte, OS);
++    return true;
++  }
++  if (Opcode == X86::RETQ) {
++    for (unsigned i = 0; i != 5; ++i)
++      EmitByte(0x90, CurByte, OS);
++    return true;
++  }
++  return false;
++}
++
+ void X86MCCodeEmitter::
+ EncodeInstruction(const MCInst &MI, raw_ostream &OS,
+                   SmallVectorImpl<MCFixup> &Fixups,
+@@ -1159,6 +1206,9 @@
+   const MCInstrDesc &Desc = MCII.get(Opcode);
+   uint64_t TSFlags = Desc.TSFlags;
+ 
++  if (EmitHQEMUInstruction(MI, OS, Fixups))
++    return;
++
+   // Pseudo instructions don't get encoded.
+   if ((TSFlags & X86II::FormMask) == X86II::Pseudo)
+     return;
+diff -ruN a/lib/Target/X86/X86CodeEmitter.cpp b/lib/Target/X86/X86CodeEmitter.cpp
+--- a/lib/Target/X86/X86CodeEmitter.cpp	2014-06-25 20:41:52.000000000 +0800
++++ b/lib/Target/X86/X86CodeEmitter.cpp	2016-07-03 21:12:39.138529935 +0800
+@@ -105,6 +105,8 @@
+     void emitMemModRMByte(const MachineInstr &MI,
+                           unsigned Op, unsigned RegOpcodeField,
+                           intptr_t PCAdj = 0);
++    void emitQMMU(MachineInstr &MI, const MCInstrDesc *Desc);
++    bool emitHQEMUInstruction(MachineInstr &MI, const MCInstrDesc *Desc);
+ 
+     unsigned getX86RegNum(unsigned RegNo) const {
+       const TargetRegisterInfo *TRI = TM.getRegisterInfo();
+@@ -113,6 +115,13 @@
+ 
+     unsigned char getVEXRegisterEncoding(const MachineInstr &MI,
+                                          unsigned OpNum) const;
++    unsigned char getWriteMaskRegisterEncoding(const MachineInstr &MI,
++                                               unsigned OpNum) const {
++      assert(X86::K0 != MI.getOperand(OpNum).getReg() &&
++             "Invalid mask register as write-mask!");
++      unsigned MaskRegNum = getX86RegNum(MI.getOperand(OpNum).getReg());
++      return MaskRegNum;
++    }
+   };
+ 
+ template<class CodeEmitter>
+@@ -748,9 +757,11 @@
+                                                const MCInstrDesc *Desc) const {
+   unsigned char Encoding = (TSFlags & X86II::EncodingMask) >>
+                            X86II::EncodingShift;
++  bool HasEVEX_K = ((TSFlags >> X86II::VEXShift) & X86II::EVEX_K);
+   bool HasVEX_4V = (TSFlags >> X86II::VEXShift) & X86II::VEX_4V;
+   bool HasVEX_4VOp3 = (TSFlags >> X86II::VEXShift) & X86II::VEX_4VOp3;
+   bool HasMemOp4 = (TSFlags >> X86II::VEXShift) & X86II::MemOp4;
++  bool HasEVEX_RC = (TSFlags >> X86II::VEXShift) & X86II::EVEX_RC;
+ 
+   // VEX_R: opcode externsion equivalent to REX.R in
+   // 1's complement (inverted) form
+@@ -759,6 +770,7 @@
+   //  0: Same as REX_R=1 (64 bit mode only)
+   //
+   unsigned char VEX_R = 0x1;
++  unsigned char EVEX_R2 = 0x1;
+ 
+   // VEX_X: equivalent to REX.X, only used when a
+   // register is used for index in SIB Byte.
+@@ -793,6 +805,7 @@
+   // VEX_4V (VEX vvvv field): a register specifier
+   // (in 1's complement form) or 1111 if unused.
+   unsigned char VEX_4V = 0xf;
++  unsigned char EVEX_V2 = 0x1;
+ 
+   // VEX_L (Vector Length):
+   //
+@@ -800,6 +813,7 @@
+   //  1: 256-bit vector
+   //
+   unsigned char VEX_L = 0;
++  unsigned char EVEX_L2 = 0;
+ 
+   // VEX_PP: opcode extension providing equivalent
+   // functionality of a SIMD prefix
+@@ -811,11 +825,36 @@
+   //
+   unsigned char VEX_PP = 0;
+ 
++  // EVEX_U
++  unsigned char EVEX_U = 1; // Always '1' so far
++
++  // EVEX_z
++  unsigned char EVEX_z = 0;
++
++  // EVEX_b
++  unsigned char EVEX_b = 0;
++
++  // EVEX_rc
++  unsigned char EVEX_rc = 0;
++
++  // EVEX_aaa
++  unsigned char EVEX_aaa = 0;
++
++  bool EncodeRC = false;
++
+   if ((TSFlags >> X86II::VEXShift) & X86II::VEX_W)
+     VEX_W = 1;
+ 
+   if ((TSFlags >> X86II::VEXShift) & X86II::VEX_L)
+     VEX_L = 1;
++  if (((TSFlags >> X86II::VEXShift) & X86II::EVEX_L2))
++    EVEX_L2 = 1;
++
++  if (HasEVEX_K && ((TSFlags >> X86II::VEXShift) & X86II::EVEX_Z))
++    EVEX_z = 1;
++
++  if (((TSFlags >> X86II::VEXShift) & X86II::EVEX_B))
++    EVEX_b = 1;
+ 
+   switch (TSFlags & X86II::OpPrefixMask) {
+   default: break; // VEX_PP already correct
+@@ -836,15 +875,7 @@
+ 
+   // Classify VEX_B, VEX_4V, VEX_R, VEX_X
+   unsigned NumOps = Desc->getNumOperands();
+-  unsigned CurOp = 0;
+-  if (NumOps > 1 && Desc->getOperandConstraint(1, MCOI::TIED_TO) == 0)
+-    ++CurOp;
+-  else if (NumOps > 3 && Desc->getOperandConstraint(2, MCOI::TIED_TO) == 0) {
+-    assert(Desc->getOperandConstraint(NumOps - 1, MCOI::TIED_TO) == 1);
+-    // Special case for GATHER with 2 TIED_TO operands
+-    // Skip the first 2 operands: dst, mask_wb
+-    CurOp += 2;
+-  }
++  unsigned CurOp = X86II::getOperandBias(*Desc);
+ 
+   switch (TSFlags & X86II::FormMask) {
+     default: llvm_unreachable("Unexpected form in emitVEXOpcodePrefix!");
+@@ -860,14 +891,28 @@
+         VEX_B = 0x0;
+       if (X86II::isX86_64ExtendedReg(MI.getOperand(X86::AddrIndexReg).getReg()))
+         VEX_X = 0x0;
++      if (X86II::is32ExtendedReg(MI.getOperand(X86::AddrIndexReg).getReg()))
++        EVEX_V2 = 0x0;
+ 
+       CurOp = X86::AddrNumOperands;
+-      if (HasVEX_4V)
+-        VEX_4V = getVEXRegisterEncoding(MI, CurOp++);
++
++      if (HasEVEX_K)
++        EVEX_aaa = getWriteMaskRegisterEncoding(MI, CurOp++);
++
++      if (HasVEX_4V) {
++        VEX_4V = getVEXRegisterEncoding(MI, CurOp);
++        if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++          EVEX_V2 = 0x0;
++        CurOp++;
++      }
+ 
+       const MachineOperand &MO = MI.getOperand(CurOp);
+-      if (MO.isReg() && X86II::isX86_64ExtendedReg(MO.getReg()))
+-        VEX_R = 0x0;
++      if (MO.isReg()) {
++        if (X86II::isX86_64ExtendedReg(MO.getReg()))
++          VEX_R = 0x0;
++        if (X86II::is32ExtendedReg(MO.getReg()))
++          EVEX_R2 = 0x0;
++      }
+       break;
+     }
+     case X86II::MRMSrcMem:
+@@ -882,10 +927,17 @@
+       //  dst(ModR/M.reg), src1(VEX_4V), src2(VEX_I8IMM), src3(ModR/M),
+       if (X86II::isX86_64ExtendedReg(MI.getOperand(CurOp).getReg()))
+         VEX_R = 0x0;
++      if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++        EVEX_R2 = 0x0;
+       CurOp++;
+ 
++      if (HasEVEX_K)
++        EVEX_aaa = getWriteMaskRegisterEncoding(MI, CurOp++);
++
+       if (HasVEX_4V) {
+         VEX_4V = getVEXRegisterEncoding(MI, CurOp);
++        if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++          EVEX_V2 = 0x0;
+         CurOp++;
+       }
+ 
+@@ -896,6 +948,10 @@
+                           MI.getOperand(MemOperand+X86::AddrIndexReg).getReg()))
+         VEX_X = 0x0;
+ 
++      if (X86II::is32ExtendedReg(
++                          MI.getOperand(MemOperand+X86::AddrIndexReg).getReg()))
++        EVEX_V2 = 0x0;
++
+       if (HasVEX_4VOp3)
+         VEX_4V = getVEXRegisterEncoding(MI, CurOp+X86::AddrNumOperands);
+       break;
+@@ -906,8 +962,15 @@
+       // MRM[0-9]m instructions forms:
+       //  MemAddr
+       //  src1(VEX_4V), MemAddr
+-      if (HasVEX_4V)
+-        VEX_4V = getVEXRegisterEncoding(MI, CurOp++);
++      if (HasVEX_4V) {
++        VEX_4V = getVEXRegisterEncoding(MI, CurOp);
++        if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++          EVEX_V2 = 0x0;
++        CurOp++;
++      }
++
++      if (HasEVEX_K)
++        EVEX_aaa = getWriteMaskRegisterEncoding(MI, CurOp++);
+ 
+       if (X86II::isX86_64ExtendedReg(
+                           MI.getOperand(MemOperand+X86::AddrBaseReg).getReg()))
+@@ -925,19 +988,38 @@
+       //
+       if (X86II::isX86_64ExtendedReg(MI.getOperand(CurOp).getReg()))
+         VEX_R = 0x0;
++      if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++        EVEX_R2 = 0x0;
+       CurOp++;
+ 
+-      if (HasVEX_4V)
+-        VEX_4V = getVEXRegisterEncoding(MI, CurOp++);
++      if (HasEVEX_K)
++        EVEX_aaa = getWriteMaskRegisterEncoding(MI, CurOp++);
++
++      if (HasVEX_4V) {
++        VEX_4V = getVEXRegisterEncoding(MI, CurOp);
++        if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++          EVEX_V2 = 0x0;
++        CurOp++;
++      }
+ 
+       if (HasMemOp4) // Skip second register source (encoded in I8IMM)
+         CurOp++;
+ 
+       if (X86II::isX86_64ExtendedReg(MI.getOperand(CurOp).getReg()))
+         VEX_B = 0x0;
++      if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++        VEX_X = 0x0;
+       CurOp++;
+       if (HasVEX_4VOp3)
+         VEX_4V = getVEXRegisterEncoding(MI, CurOp);
++      if (EVEX_b) {
++        if (HasEVEX_RC) {
++          unsigned RcOperand = NumOps-1;
++          assert(RcOperand >= CurOp);
++          EVEX_rc = MI.getOperand(RcOperand).getImm() & 0x3;
++        }
++        EncodeRC = true;
++      }
+       break;
+     case X86II::MRMDestReg:
+       // MRMDestReg instructions forms:
+@@ -946,13 +1028,26 @@
+       //  dst(ModR/M), src1(VEX_4V), src2(ModR/M)
+       if (X86II::isX86_64ExtendedReg(MI.getOperand(CurOp).getReg()))
+         VEX_B = 0x0;
++      if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++        VEX_X = 0x0;
+       CurOp++;
+ 
+-      if (HasVEX_4V)
+-        VEX_4V = getVEXRegisterEncoding(MI, CurOp++);
++      if (HasEVEX_K)
++        EVEX_aaa = getWriteMaskRegisterEncoding(MI, CurOp++);
++
++      if (HasVEX_4V) {
++        VEX_4V = getVEXRegisterEncoding(MI, CurOp);
++        if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++          EVEX_V2 = 0x0;
++        CurOp++;
++      }
+ 
+       if (X86II::isX86_64ExtendedReg(MI.getOperand(CurOp).getReg()))
+         VEX_R = 0x0;
++      if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++        EVEX_R2 = 0x0;
++      if (EVEX_b)
++        EncodeRC = true;
+       break;
+     case X86II::MRM0r: case X86II::MRM1r:
+     case X86II::MRM2r: case X86II::MRM3r:
+@@ -960,45 +1055,190 @@
+     case X86II::MRM6r: case X86II::MRM7r:
+       // MRM0r-MRM7r instructions forms:
+       //  dst(VEX_4V), src(ModR/M), imm8
+-      VEX_4V = getVEXRegisterEncoding(MI, CurOp);
+-      CurOp++;
++      if (HasVEX_4V) {
++        VEX_4V = getVEXRegisterEncoding(MI, CurOp);
++        if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++          EVEX_V2 = 0x0;
++        CurOp++;
++      }
++      if (HasEVEX_K)
++        EVEX_aaa = getWriteMaskRegisterEncoding(MI, CurOp++);
+ 
+       if (X86II::isX86_64ExtendedReg(MI.getOperand(CurOp).getReg()))
+         VEX_B = 0x0;
++      if (X86II::is32ExtendedReg(MI.getOperand(CurOp).getReg()))
++        VEX_X = 0x0;
+       break;
+   }
+ 
+-  // Emit segment override opcode prefix as needed.
+-  emitSegmentOverridePrefix(TSFlags, MemOperand, MI);
++  if (Encoding == X86II::VEX || Encoding == X86II::XOP) {
++    // Emit segment override opcode prefix as needed.
++    emitSegmentOverridePrefix(TSFlags, MemOperand, MI);
++
++    // VEX opcode prefix can have 2 or 3 bytes
++    //
++    //  3 bytes:
++    //    +-----+ +--------------+ +-------------------+
++    //    | C4h | | RXB | m-mmmm | | W | vvvv | L | pp |
++    //    +-----+ +--------------+ +-------------------+
++    //  2 bytes:
++    //    +-----+ +-------------------+
++    //    | C5h | | R | vvvv | L | pp |
++    //    +-----+ +-------------------+
++    //
++    //  XOP uses a similar prefix:
++    //    +-----+ +--------------+ +-------------------+
++    //    | 8Fh | | RXB | m-mmmm | | W | vvvv | L | pp |
++    //    +-----+ +--------------+ +-------------------+
++    unsigned char LastByte = VEX_PP | (VEX_L << 2) | (VEX_4V << 3);
++  
++    // Can this use the 2 byte VEX prefix?
++    if (Encoding == X86II::VEX && VEX_B && VEX_X && !VEX_W && (VEX_5M == 1)) {
++      MCE.emitByte(0xC5);
++      MCE.emitByte(LastByte | (VEX_R << 7));
++      return;
++    }
++  
++    // 3 byte VEX prefix
++    MCE.emitByte(Encoding == X86II::XOP ? 0x8F : 0xC4);
++    MCE.emitByte(VEX_R << 7 | VEX_X << 6 | VEX_B << 5 | VEX_5M);
++    MCE.emitByte(LastByte | (VEX_W << 7));
++  } else {
++    assert(Encoding == X86II::EVEX && "unknown encoding!");
++    // EVEX opcode prefix can have 4 bytes
++    //
++    // +-----+ +--------------+ +-------------------+ +------------------------+
++    // | 62h | | RXBR' | 00mm | | W | vvvv | U | pp | | z | L'L | b | v' | aaa |
++    // +-----+ +--------------+ +-------------------+ +------------------------+
++    assert((VEX_5M & 0x3) == VEX_5M
++           && "More than 2 significant bits in VEX.m-mmmm fields for EVEX!");
++
++    VEX_5M &= 0x3;
++
++    MCE.emitByte(0x62);
++    MCE.emitByte((VEX_R   << 7) |
++                 (VEX_X   << 6) |
++                 (VEX_B   << 5) |
++                 (EVEX_R2 << 4) |
++                 VEX_5M);
++    MCE.emitByte((VEX_W   << 7) |
++                 (VEX_4V  << 3) |
++                 (EVEX_U  << 2) |
++                 VEX_PP);
++    if (EncodeRC)
++      MCE.emitByte((EVEX_z  << 7) |
++                   (EVEX_rc << 5) |
++                   (EVEX_b  << 4) |
++                   (EVEX_V2 << 3) |
++                   EVEX_aaa);
++    else
++      MCE.emitByte((EVEX_z  << 7) |
++                   (EVEX_L2 << 6) |
++                   (VEX_L   << 5) |
++                   (EVEX_b  << 4) |
++                   (EVEX_V2 << 3) |
++                   EVEX_aaa);
++  }
++}
++
++template<class CodeEmitter>
++void Emitter<CodeEmitter>::emitQMMU(MachineInstr &MI,
++                                    const MCInstrDesc *Desc) {
++  // QMMU stub is as follows:
++  //   jmp QMMUExit
++  //   nop
++  //   jmp QMMUMiss
++  MachineBasicBlock *MBB = MI.getParent();
++  if (MBB->succ_size() != 2)
++    llvm_unreachable("Unhandled QMMU stub!");
++
++  MachineBasicBlock* QMMUExit = *MBB->succ_begin();
++  MachineBasicBlock* QMMUMiss = *(++MBB->succ_begin());
++  MachineInstr *MRI = &*QMMUMiss->rbegin();
++  if (MRI->getDesc().getOpcode() != X86::TRAP) {
++    MachineBasicBlock *tmp = QMMUExit;
++    QMMUExit = QMMUMiss;
++    QMMUMiss = tmp;
++  }
++
++  MRI = &*QMMUMiss->rbegin();
++  if (MRI->getDesc().getOpcode() != X86::TRAP)
++    llvm_unreachable("Unknown QMMU CFG!");
++
++  MCE.emitByte(0xE9);
++  emitPCRelativeBlockAddress(QMMUExit);
++  MCE.emitByte(0x90);
++  if (QMMUMiss != ++MachineFunction::iterator(MBB)) {
++    MCE.emitByte(0xE9);
++    emitPCRelativeBlockAddress(QMMUMiss);
++  }
++}
+ 
+-  // VEX opcode prefix can have 2 or 3 bytes
+-  //
+-  //  3 bytes:
+-  //    +-----+ +--------------+ +-------------------+
+-  //    | C4h | | RXB | m-mmmm | | W | vvvv | L | pp |
+-  //    +-----+ +--------------+ +-------------------+
+-  //  2 bytes:
+-  //    +-----+ +-------------------+
+-  //    | C5h | | R | vvvv | L | pp |
+-  //    +-----+ +-------------------+
+-  //
+-  //  XOP uses a similar prefix:
+-  //    +-----+ +--------------+ +-------------------+
+-  //    | 8Fh | | RXB | m-mmmm | | W | vvvv | L | pp |
+-  //    +-----+ +--------------+ +-------------------+
+-  unsigned char LastByte = VEX_PP | (VEX_L << 2) | (VEX_4V << 3);
+-
+-  // Can this use the 2 byte VEX prefix?
+-  if (Encoding == X86II::VEX && VEX_B && VEX_X && !VEX_W && (VEX_5M == 1)) {
+-    MCE.emitByte(0xC5);
+-    MCE.emitByte(LastByte | (VEX_R << 7));
+-    return;
++template<class CodeEmitter>
++bool Emitter<CodeEmitter>::emitHQEMUInstruction(MachineInstr &MI,
++                                                const MCInstrDesc *Desc)
++{
++  /* NOTE: the following flags must be synchronized with those in file
++   *       llvm-opc.h of the HQEMU source tree. */
++  enum {
++    PATCH_HQEMU = 0x4182U,
++    PATCH_DUMMY,
++    PATCH_EXIT_TB,
++    PATCH_DIRECT_JUMP,
++    PATCH_TRACE_BLOCK_CHAINING,
++    PATCH_QMMU
++  };
++
++  unsigned Opcode = Desc->Opcode;
++
++  switch (Opcode) {
++  case X86::TRAP:
++  case X86::RETQ:
++  case X86::JMP32r:
++  case X86::JMP64r:
++    break;
++  default: return false;
++  }
++
++  LLVMContext &Ctx = MI.getParent()->getParent()->getFunction()->getContext();
++  MDNode *M = MI.getDebugLoc().getScope(Ctx);
++  if (!M || !isa<ConstantInt>(M->getOperand(1)))
++    return false;
++
++  uint64_t flag = cast<ConstantInt>(M->getOperand(1))->getZExtValue();
++  if (flag < PATCH_HQEMU || flag > PATCH_QMMU)
++    return false;
++
++  if (Opcode == X86::TRAP) {
++    if (flag == PATCH_QMMU)
++      return true;
++
++    unsigned NumNOP = 3 - MCE.getCurrentPCValue() % 4;
++    for (unsigned i = 0; i != NumNOP; ++i)
++      MCE.emitByte(0x90);
++
++    uintptr_t *ChainPoint = (uintptr_t *)cast<ConstantInt>(M->getOperand(2))->getZExtValue();
++    *ChainPoint = (uintptr_t) MCE.getCurrentPCValue();
++    MCE.emitByte(0xE9);
++    emitConstant(0, 4);
++    return true;
+   }
+ 
+-  // 3 byte VEX prefix
+-  MCE.emitByte(Encoding == X86II::XOP ? 0x8F : 0xC4);
+-  MCE.emitByte(VEX_R << 7 | VEX_X << 6 | VEX_B << 5 | VEX_5M);
+-  MCE.emitByte(LastByte | (VEX_W << 7));
++  if (Opcode == X86::RETQ) {
++    uintptr_t ExitAddr = (uintptr_t)cast<ConstantInt>(M->getOperand(2))->getZExtValue();
++    uintptr_t Disp = ExitAddr - ((uintptr_t) MCE.getCurrentPCValue() + 5);
++    MCE.emitByte(0xE9);
++    emitConstant(Disp, 4);
++    return true;
++  }
++  
++  if (Opcode == X86::JMP32r || Opcode == X86::JMP64r) {
++    if (flag == PATCH_QMMU) {
++      emitQMMU(MI, Desc);
++      return true;
++    }
++  }
++  return false;
+ }
+ 
+ template<class CodeEmitter>
+@@ -1032,6 +1272,11 @@
+ 
+   unsigned Opcode = Desc->Opcode;
+ 
++  if (emitHQEMUInstruction(MI, Desc)) {
++    MCE.processDebugLoc(MI.getDebugLoc(), false);
++    return;
++  }
++
+   // If this is a two-address instruction, skip one of the register operands.
+   unsigned NumOps = Desc->getNumOperands();
+   unsigned CurOp = 0;
+diff -ruN a/lib/Target/X86/X86MCInstLower.cpp b/lib/Target/X86/X86MCInstLower.cpp
+--- a/lib/Target/X86/X86MCInstLower.cpp	2014-06-29 09:52:01.000000000 +0800
++++ b/lib/Target/X86/X86MCInstLower.cpp	2016-07-03 21:12:39.138529935 +0800
+@@ -345,6 +345,10 @@
+ void X86MCInstLower::Lower(const MachineInstr *MI, MCInst &OutMI) const {
+   OutMI.setOpcode(MI->getOpcode());
+ 
++  DebugLoc Loc = MI->getDebugLoc();
++  if (!Loc.isUnknown())
++    OutMI.setDebugLoc(Loc);
++
+   for (unsigned i = 0, e = MI->getNumOperands(); i != e; ++i) {
+     const MachineOperand &MO = MI->getOperand(i);
+ 
+diff -ruN a/lib/Target/X86/X86RegisterInfo.cpp b/lib/Target/X86/X86RegisterInfo.cpp
+--- a/lib/Target/X86/X86RegisterInfo.cpp	2014-07-10 02:53:57.000000000 +0800
++++ b/lib/Target/X86/X86RegisterInfo.cpp	2016-07-03 21:50:45.474511611 +0800
+@@ -395,9 +395,65 @@
+     }
+   }
+ 
++  getHQEMUReservedRegs(Reserved);
+   return Reserved;
+ }
+ 
++void X86RegisterInfo::getHQEMUReservedRegs(BitVector &Reserved) const {
++  for (unsigned i = 0, e = HQEMUReservedRegs.size(); i != e; ++i)
++    Reserved.set(HQEMUReservedRegs[i]);
++}
++
++void X86RegisterInfo::setHQEMUReservedRegs(std::string RegName) {
++#define RESERVE1(x) \
++  do { \
++    HQEMUReservedRegs.push_back(X86::x ## L); \
++    HQEMUReservedRegs.push_back(X86::x ## H); \
++    HQEMUReservedRegs.push_back(X86::x ## X);\
++    HQEMUReservedRegs.push_back(X86::E ## x ## X);\
++    HQEMUReservedRegs.push_back(X86::R ## x ## X);\
++    return; \
++  } while(0)
++
++#define RESERVE2(x) \
++  do { \
++    HQEMUReservedRegs.push_back(X86::R ## x); \
++    HQEMUReservedRegs.push_back(X86::R ## x ## B);\
++    HQEMUReservedRegs.push_back(X86::R ## x ## D);\
++    HQEMUReservedRegs.push_back(X86::R ## x ## W);\
++    return; \
++  } while(0)
++
++  if (RegName == "ebp") {
++    // 32-bit registers
++    HQEMUReservedRegs.push_back(X86::EBP);
++    // 16-bit registers
++    HQEMUReservedRegs.push_back(X86::BP);
++#if defined(__x86_64__)
++    // X86-64 only
++    HQEMUReservedRegs.push_back(X86::BPL);
++#endif
++    return;
++  }
++#if defined(__x86_64__)
++  if (RegName == "rax") RESERVE1(A);
++  if (RegName == "rbx") RESERVE1(B);
++  if (RegName == "rcx") RESERVE1(C);
++  if (RegName == "rdx") RESERVE1(D);
++  if (RegName == "r8")  RESERVE2(8);
++  if (RegName == "r9")  RESERVE2(9);
++  if (RegName == "r10") RESERVE2(10);
++  if (RegName == "r11") RESERVE2(11);
++  if (RegName == "r12") RESERVE2(12);
++  if (RegName == "r13") RESERVE2(13);
++  if (RegName == "r14") RESERVE2(14);
++  if (RegName == "r15") RESERVE2(15);
++#endif
++
++#undef RESERVE1
++#undef RESERVE2
++}
++
+ //===----------------------------------------------------------------------===//
+ // Stack Frame Processing methods
+ //===----------------------------------------------------------------------===//
+diff -ruN a/lib/Target/X86/X86RegisterInfo.h b/lib/Target/X86/X86RegisterInfo.h
+--- a/lib/Target/X86/X86RegisterInfo.h	2014-07-10 02:53:57.000000000 +0800
++++ b/lib/Target/X86/X86RegisterInfo.h	2016-07-03 21:50:35.434511691 +0800
+@@ -107,6 +107,9 @@
+   /// register scavenger to determine what registers are free.
+   BitVector getReservedRegs(const MachineFunction &MF) const override;
+ 
++  void getHQEMUReservedRegs(BitVector &Reserved) const override;
++  void setHQEMUReservedRegs(std::string RegName) override;
++
+   bool hasBasePointer(const MachineFunction &MF) const;
+ 
+   bool canRealignStack(const MachineFunction &MF) const;
+diff -ruN a/lib/Transforms/Utils/Local.cpp b/lib/Transforms/Utils/Local.cpp
+--- a/lib/Transforms/Utils/Local.cpp	2014-07-22 01:06:51.000000000 +0800
++++ b/lib/Transforms/Utils/Local.cpp	2016-07-03 21:12:39.138529935 +0800
+@@ -1188,12 +1188,15 @@
+           // If we found a call to a no-return function, insert an unreachable
+           // instruction after it.  Make sure there isn't *already* one there
+           // though.
++#if 0
++          // HQEMU: do not delete instructions after llvm.trap.
+           ++BBI;
+           if (!isa<UnreachableInst>(BBI)) {
+             // Don't insert a call to llvm.trap right before the unreachable.
+             changeToUnreachable(BBI, false);
+             Changed = true;
+           }
++#endif
+           break;
+         }
+       }
+diff -ruN a/lib/Transforms/Utils/SimplifyCFG.cpp b/lib/Transforms/Utils/SimplifyCFG.cpp
+--- a/lib/Transforms/Utils/SimplifyCFG.cpp	2015-03-18 04:42:08.000000000 +0800
++++ b/lib/Transforms/Utils/SimplifyCFG.cpp	2016-07-03 21:12:39.142529935 +0800
+@@ -1028,6 +1028,11 @@
+ 
+   bool Changed = false;
+   do {
++    // HQEMU: skip hoisting instructions from llvm.trap to the terminator
++    // instruction.
++    if (isa<IntrinsicInst>(I1) || I1->hasMetadata())
++      return Changed;
++
+     // If we are hoisting the terminator instruction, don't move one (making a
+     // broken BB), instead clone it, and remove BI.
+     if (isa<TerminatorInst>(I1))
+@@ -3968,6 +3973,10 @@
+   BasicBlock *BB = IBI->getParent();
+   bool Changed = false;
+ 
++  // HQEMU: LLVM tries to remove the indirectbr with no successors.
++  // Disable it because we use indirectbr to implement IBTC.
++  return false;
++
+   // Eliminate redundant destinations.
+   SmallPtrSet<Value *, 8> Succs;
+   for (unsigned i = 0, e = IBI->getNumDestinations(); i != e; ++i) {
